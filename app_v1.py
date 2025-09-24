@@ -15,10 +15,11 @@ SCOPE = [
 ]
 
 # Cargar credenciales
-creds = Credentials.from_service_account_file(
-    "pagosfutbol-f392b5a5fb90.json", scopes=SCOPE
-)
+# Cargar credenciales desde Streamlit Secrets
+creds_dict = st.secrets["gcp"]  # "gcp" es el nombre del Secret que creaste
+creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
 client = gspread.authorize(creds)
+
 
 # Conectar con el archivo "Pagos"
 SPREADSHEET_NAME = "Pagos"
@@ -137,3 +138,4 @@ elif menu == "📊 Ver pagos":
         st.info("No hay datos para mostrar.")
     else:
         st.dataframe(df)
+
