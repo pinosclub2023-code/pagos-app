@@ -91,7 +91,7 @@ data["Torneos"] = load_sheet("Torneos")
 
 # ✅ Refrescar una sola hoja cuando escribas algo
 def refresh_sheet(sheet_name):
-    return load_sheet(sheet_name)()
+    return load_sheet(sheet_name)
 
 # ===============================
 # 4️⃣  FUNCIONES DE ESCRITURA
@@ -285,6 +285,7 @@ elif menu == "📊 Ver datos":
     st.dataframe(df if not df.empty else pd.DataFrame({"Info": ["No hay datos en esta hoja"]}))
 
    
+
 
 
 
