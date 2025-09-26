@@ -32,7 +32,13 @@ creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
 client = gspread.authorize(creds)
 
 SPREADSHEET_NAME = "Pagos"
-spreadsheet = client.open(SPREADSHEET_NAME)
+
+@st.cache_resource
+def get_spreadsheet():
+    return client.open(SPREADSHEET_NAME)
+
+spreadsheet = get_spreadsheet()
+
 
 # ===============================
 # 2️⃣  UTIL: crear/obtener hojas
@@ -69,20 +75,23 @@ ensure_all_sheets_exist()
 # ===============================
 # 3️⃣  CARGA GLOBAL CON CACHE (OPTIMIZADA)
 # ===============================
-@st.cache_data(ttl=60)
-def load_all_data():
-    data = {}
-    data["Jugadores"] = pd.DataFrame(spreadsheet.worksheet("Jugadores").get_all_records())
-    for c in categorias:
-        data[c] = pd.DataFrame(spreadsheet.worksheet(c).get_all_records())
-    data["Uniformes"] = pd.DataFrame(spreadsheet.worksheet("Uniformes").get_all_records())
-    data["Torneos"] = pd.DataFrame(spreadsheet.worksheet("Torneos").get_all_records())
-    return data
+# ✅ Cargar cada hoja de forma independiente (y cacheada por 2 min)
+@st.cache_data(ttl=120)
+def load_sheet(sheet_name):
+    ws = spreadsheet.worksheet(sheet_name)
+    return pd.DataFrame(ws.get_all_records())
 
+# ✅ Cargar datos solo una vez al inicio
+data = {}
+data["Jugadores"] = load_sheet("Jugadores")
+for c in categorias:
+    data[c] = load_sheet(c)
+data["Uniformes"] = load_sheet("Uniformes")
+data["Torneos"] = load_sheet("Torneos")
+
+# ✅ Refrescar una sola hoja cuando escribas algo
 def refresh_sheet(sheet_name):
-    return pd.DataFrame(spreadsheet.worksheet(sheet_name).get_all_records())
-
-data = load_all_data()
+    return load_sheet(sheet_name)()
 
 # ===============================
 # 4️⃣  FUNCIONES DE ESCRITURA
@@ -276,5 +285,6 @@ elif menu == "📊 Ver datos":
     st.dataframe(df if not df.empty else pd.DataFrame({"Info": ["No hay datos en esta hoja"]}))
 
    
+
 
 
