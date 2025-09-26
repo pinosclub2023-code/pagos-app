@@ -9,7 +9,7 @@ import gspread.exceptions
 st.set_page_config(page_title="Pagos Escuela de Fútbol", layout="wide")
 
 # ===============================
-# 0️⃣  CONFIG - MESES Y CATEGORÍAS
+# 0️⃣ CONFIG - MESES Y CATEGORÍAS
 # ===============================
 meses = [
     "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
@@ -18,7 +18,7 @@ meses = [
 categorias = [str(y) for y in range(2011, 2022)]  # 2011..2021
 
 # ===============================
-# 1️⃣  CONFIGURACIÓN GOOGLE SHEETS
+# 1️⃣ CONFIGURACIÓN GOOGLE SHEETS
 # ===============================
 SCOPE = [
     "https://spreadsheets.google.com/feeds",
@@ -39,9 +39,8 @@ def get_spreadsheet():
 
 spreadsheet = get_spreadsheet()
 
-
 # ===============================
-# 2️⃣  UTIL: crear/obtener hojas
+# 2️⃣ CREAR/OBTENER HOJAS SI NO EXISTEN
 # ===============================
 def get_or_create_worksheet(name, header=None):
     try:
@@ -73,28 +72,27 @@ def ensure_all_sheets_exist():
 ensure_all_sheets_exist()
 
 # ===============================
-# 3️⃣  CARGA GLOBAL CON CACHE (OPTIMIZADA)
+# 3️⃣ CARGA GLOBAL (OPTIMIZADA)
 # ===============================
-# ✅ Cargar cada hoja de forma independiente (y cacheada por 2 min)
-@st.cache_data(ttl=120)
+
+# ✅ Cache más alto para evitar bloqueos por exceso de lecturas
+@st.cache_data(ttl=600)
 def load_sheet(sheet_name):
     ws = spreadsheet.worksheet(sheet_name)
     return pd.DataFrame(ws.get_all_records())
 
-# ✅ Cargar datos solo una vez al inicio
+# ✅ Solo cargamos las hojas generales (Jugadores, Uniformes, Torneos)
 data = {}
 data["Jugadores"] = load_sheet("Jugadores")
-for c in categorias:
-    data[c] = load_sheet(c)
 data["Uniformes"] = load_sheet("Uniformes")
 data["Torneos"] = load_sheet("Torneos")
 
-# ✅ Refrescar una sola hoja cuando escribas algo
+# ✅ Refrescar una sola hoja
 def refresh_sheet(sheet_name):
     return load_sheet(sheet_name)
 
 # ===============================
-# 4️⃣  FUNCIONES DE ESCRITURA
+# 4️⃣ FUNCIONES DE ESCRITURA
 # ===============================
 def append_row_to_sheet(sheet_name, row_dict, header_order=None):
     ws = spreadsheet.worksheet(sheet_name)
@@ -108,7 +106,7 @@ def save_df_to_sheet(sheet_name, df):
     ws.update([df.columns.values.tolist()] + df.values.tolist())
 
 # ===============================
-# 5️⃣  OPERACIONES: Jugadores
+# 5️⃣ GESTIÓN DE JUGADORES
 # ===============================
 def add_player_record(player_data):
     if not player_data.get("Documento"):
@@ -117,10 +115,7 @@ def add_player_record(player_data):
     if not df_jug.empty and player_data["Documento"] in df_jug["Documento"].astype(str).values:
         return False, "Ya existe un jugador con ese documento."
 
-    append_row_to_sheet("Jugadores", player_data, header_order=list(data["Jugadores"].columns) if not data["Jugadores"].empty else [
-        "Nombres", "Apellidos", "Documento", "Fecha nacimiento", "Categoría", "Nombre acudiente",
-        "Dirección", "Cédula acudiente", "Correo", "Contacto"
-    ])
+    append_row_to_sheet("Jugadores", player_data)
     nombre_completo = f"{player_data.get('Nombres','')} {player_data.get('Apellidos','')}".strip()
     categoria = player_data.get("Categoría")
     if categoria in categorias:
@@ -130,8 +125,6 @@ def add_player_record(player_data):
         append_row_to_sheet(categoria, row, header_order=["Jugador"] + meses)
 
     data["Jugadores"] = refresh_sheet("Jugadores")
-    if categoria in categorias:
-        data[categoria] = refresh_sheet(categoria)
     return True, "✅ Jugador agregado correctamente."
 
 def delete_player_by_document(documento):
@@ -147,12 +140,10 @@ def delete_player_by_document(documento):
     return True, "✅ Jugador eliminado de 'Jugadores'."
 
 # ===============================
-# 6️⃣  OPERACIONES: Pagos
+# 6️⃣ PAGOS
 # ===============================
 def update_monthly_payment(categoria, jugador_nombre, mes, monto):
-    if categoria not in categorias:
-        return False, "Categoría inválida."
-    df = data[categoria]
+    df = load_sheet(categoria)  # ✅ carga bajo demanda
     if df.empty:
         return False, "Hoja de categoría vacía."
     mask = df["Jugador"].astype(str) == str(jugador_nombre)
@@ -160,7 +151,6 @@ def update_monthly_payment(categoria, jugador_nombre, mes, monto):
         return False, "Jugador no encontrado."
     df.loc[mask, mes] = monto
     save_df_to_sheet(categoria, df)
-    data[categoria] = refresh_sheet(categoria)
     return True, "💰 Pago mensual actualizado."
 
 def register_uniform(jugador, categoria, fecha, valor, observaciones=""):
@@ -177,7 +167,7 @@ def register_torneo(jugador, categoria, nombre_torneo, fecha, valor, observacion
     return True, "🏆 Registro de torneo guardado."
 
 # ===============================
-# 7️⃣  INTERFAZ STREAMLIT
+# 7️⃣ INTERFAZ STREAMLIT
 # ===============================
 st.title("⚽ Sistema de pagos - Escuela de Fútbol (Google Sheets)")
 
@@ -239,7 +229,7 @@ elif menu == "💸 Registrar pago":
 
     if tipo == "Mensualidad":
         categoria = st.selectbox("Categoría", categorias)
-        df_cat = data[categoria]
+        df_cat = load_sheet(categoria)
         if df_cat.empty:
             st.warning("No hay jugadores en esta categoría.")
         else:
@@ -280,11 +270,13 @@ elif menu == "💸 Registrar pago":
 # ---------- VER DATOS ----------
 elif menu == "📊 Ver datos":
     st.header("📊 Ver datos (hojas)")
-    hoja = st.selectbox("Selecciona hoja para ver", ["Jugadores"] + categorias + ["Uniformes", "Torneos"])
+    hoja = st.selectbox("Selecciona hoja para ver", ["Jugadores"] + ["Uniformes", "Torneos"])
     df = data[hoja]
     st.dataframe(df if not df.empty else pd.DataFrame({"Info": ["No hay datos en esta hoja"]}))
 
+
    
+
 
 
 
