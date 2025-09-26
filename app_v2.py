@@ -1,10 +1,13 @@
 # app.py
 import streamlit as st
 import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
+import io
+import os
 from datetime import datetime
-import gspread.exceptions
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+import openpyxl
 
 st.set_page_config(page_title="Pagos Escuela de Fútbol", layout="wide")
 
@@ -18,160 +21,185 @@ meses = [
 categorias = [str(y) for y in range(2011, 2022)]  # 2011..2021
 
 # ===============================
-# 1️⃣ CONFIGURACIÓN GOOGLE SHEETS
+# 1️⃣  CONFIG: Credenciales & Drive API
 # ===============================
-SCOPE = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/spreadsheets",
+SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/drive.file",
 ]
 
-creds_dict = st.secrets["gcp"]
-creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
-client = gspread.authorize(creds)
-
-SPREADSHEET_NAME = "Pagos"
+# st.secrets["gcp"] debe contener el JSON del service account
+creds_info = st.secrets["gcp"]
+creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 
 @st.cache_resource
-def get_spreadsheet():
-    return client.open(SPREADSHEET_NAME)
+def get_drive_service():
+    return build("drive", "v3", credentials=creds)
 
-spreadsheet = get_spreadsheet()
+drive_service = get_drive_service()
+
+# Nombre del archivo en Drive
+DRIVE_FILENAME = "Pagos.xlsx"
+
+# ubicación temporal en servidor
+TMP_FILEPATH = "/tmp/pagos_drive.xlsx"
 
 # ===============================
-# 2️⃣ CREAR/OBTENER HOJAS SI NO EXISTEN
+# 2️⃣ UTIL: Operaciones con Drive y Excel
 # ===============================
-def get_or_create_worksheet(name, header=None):
-    try:
-        ws = spreadsheet.worksheet(name)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=name, rows="1000", cols="26")
-        if header:
-            ws.append_row(header)
+def find_file_id_by_name(name):
+    """Busca en Drive por nombre (en Mi unidad) y devuelve fileId o None."""
+    query = f"name = '{name}' and trashed = false"
+    res = drive_service.files().list(q=query, spaces='drive', fields="files(id, name, mimeType)").execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+def download_file_to_tmp(file_id, dest_path=TMP_FILEPATH):
+    """Descarga un archivo de Drive a ruta temporal."""
+    request = drive_service.files().get_media(fileId=file_id)
+    fh = io.FileIO(dest_path, 'wb')
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    fh.close()
+    return dest_path
+
+def upload_file_replace(file_id, local_path, mime_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'):
+    """Reemplaza un archivo existente en Drive con el contenido local."""
+    media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
+    updated = drive_service.files().update(fileId=file_id, media_body=media).execute()
+    return updated
+
+def create_file_from_local(local_path, name=DRIVE_FILENAME, mime_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'):
+    """Crea un nuevo archivo en Drive a partir de un archivo local."""
+    file_metadata = {"name": name}
+    media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
+    newf = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    return newf
+
+def load_excel_from_drive():
+    """Asegura que exista el archivo y lo carga en un dict de DataFrames (sheet_name -> df)."""
+    file_id = find_file_id_by_name(DRIVE_FILENAME)
+    if file_id:
+        # descargar
+        download_file_to_tmp(file_id)
+        try:
+            xls = pd.read_excel(TMP_FILEPATH, sheet_name=None, engine="openpyxl")
+        except Exception:
+            # archivo vacío o corrupto -> crear estructura vacía
+            xls = {}
     else:
-        if header:
-            values = ws.get_all_values()
-            if not values or len(values) == 0 or (len(values) == 1 and all([c == "" for c in values[0]])):
-                ws.clear()
-                ws.append_row(header)
-    return ws
-
-def ensure_all_sheets_exist():
-    jugadores_header = ["Nombres", "Apellidos", "Documento", "Fecha nacimiento", "Categoría",
-                        "Nombre acudiente", "Dirección", "Cédula acudiente", "Correo", "Contacto"]
-    get_or_create_worksheet("Jugadores", header=jugadores_header)
-    cat_header = ["Jugador"] + meses
+        # no existe: crear estructura vacía en memoria
+        xls = {}
+    # aseguramos todas las hojas necesarias existan (aunque vacías)
+    if "Jugadores" not in xls:
+        xls["Jugadores"] = pd.DataFrame(columns=["Nombres", "Apellidos", "Documento", "Fecha nacimiento", "Categoría",
+                                                 "Nombre acudiente", "Dirección", "Cédula acudiente", "Correo", "Contacto"])
     for c in categorias:
-        get_or_create_worksheet(c, header=cat_header)
-    uniformes_header = ["Jugador", "Categoría", "Fecha", "Valor", "Observaciones"]
-    get_or_create_worksheet("Uniformes", header=uniformes_header)
-    torneos_header = ["Jugador", "Categoría", "Nombre Torneo", "Fecha", "Valor", "Observaciones"]
-    get_or_create_worksheet("Torneos", header=torneos_header)
+        if c not in xls:
+            xls[c] = pd.DataFrame(columns=["Jugador"] + meses)
+    if "Uniformes" not in xls:
+        xls["Uniformes"] = pd.DataFrame(columns=["Jugador", "Categoría", "Fecha", "Valor", "Observaciones"])
+    if "Torneos" not in xls:
+        xls["Torneos"] = pd.DataFrame(columns=["Jugador", "Categoría", "Nombre Torneo", "Fecha", "Valor", "Observaciones"])
+    return xls, file_id
 
-ensure_all_sheets_exist()
-
-# ===============================
-# 3️⃣ CARGA GLOBAL (OPTIMIZADA)
-# ===============================
-
-# ✅ Cache más alto para evitar bloqueos por exceso de lecturas
-@st.cache_data(ttl=600)
-def load_sheet(sheet_name):
-    ws = spreadsheet.worksheet(sheet_name)
-    return pd.DataFrame(ws.get_all_records())
-
-# ✅ Solo cargamos las hojas generales (Jugadores, Uniformes, Torneos)
-data = {}
-data["Jugadores"] = load_sheet("Jugadores")
-data["Uniformes"] = load_sheet("Uniformes")
-data["Torneos"] = load_sheet("Torneos")
-
-# ✅ Refrescar una sola hoja
-def refresh_sheet(sheet_name):
-    return load_sheet(sheet_name)
-
-# ===============================
-# 4️⃣ FUNCIONES DE ESCRITURA
-# ===============================
-def append_row_to_sheet(sheet_name, row_dict, header_order=None):
-    ws = spreadsheet.worksheet(sheet_name)
-    header = header_order if header_order else ws.row_values(1)
-    row = [row_dict.get(col, "") for col in header]
-    ws.append_row(row)
-
-def save_df_to_sheet(sheet_name, df):
-    ws = spreadsheet.worksheet(sheet_name)
-    ws.clear()
-    ws.update([df.columns.values.tolist()] + df.values.tolist())
+def save_excel_and_upload(xls_dict, file_id=None):
+    """Guarda dict de DataFrames a Excel local y sube a Drive (crea o reemplaza)."""
+    # grabar localmente
+    with pd.ExcelWriter(TMP_FILEPATH, engine="openpyxl") as writer:
+        for sheet_name, df in xls_dict.items():
+            # convertir NaN a cadena vacía para que el Excel no muestre NaN
+            df_to_write = df.copy()
+            df_to_write.fillna("", inplace=True)
+            df_to_write.to_excel(writer, sheet_name=sheet_name, index=False)
+    # subir
+    if file_id:
+        upload_file_replace(file_id, TMP_FILEPATH)
+    else:
+        newf = create_file_from_local(TMP_FILEPATH, name=DRIVE_FILENAME)
+        file_id = newf.get("id")
+    # opcional: eliminar tmp
+    try:
+        os.remove(TMP_FILEPATH)
+    except Exception:
+        pass
+    return file_id
 
 # ===============================
-# 5️⃣ GESTIÓN DE JUGADORES
+# 3️⃣  FUNCIONES PRINCIPALES (lectura y escritura local+drive)
 # ===============================
-def add_player_record(player_data):
-    if not player_data.get("Documento"):
-        return False, "El campo Documento es obligatorio."
-    df_jug = data["Jugadores"]
-    if not df_jug.empty and player_data["Documento"] in df_jug["Documento"].astype(str).values:
+@st.cache_data(ttl=60)
+def load_all_from_drive_cached():
+    # cachea la lectura por 60s para evitar múltiples descargas seguidas
+    xls, fid = load_excel_from_drive()
+    return xls, fid
+
+def refresh_sheet_in_memory(xls, sheet_name):
+    # reload the sheet from drive (used sparingly)
+    xls_new, fid = load_excel_from_drive()
+    return xls_new, fid
+
+# ===============================
+# 4️⃣  OPERACIONES: Jugadores y pagos (trabajando sobre xls dict)
+# ===============================
+def add_player_to_xls(xls, player_data):
+    df_j = xls["Jugadores"]
+    # duplicado por Documento
+    if player_data.get("Documento") and (player_data["Documento"].astype(str) if isinstance(player_data["Documento"], pd.Series) else str(player_data["Documento"])) in df_j["Documento"].astype(str).values:
         return False, "Ya existe un jugador con ese documento."
-
-    append_row_to_sheet("Jugadores", player_data)
-    nombre_completo = f"{player_data.get('Nombres','')} {player_data.get('Apellidos','')}".strip()
+    # append
+    df_j = pd.concat([df_j, pd.DataFrame([player_data])], ignore_index=True)
+    xls["Jugadores"] = df_j
+    # agregar a categoría matriz
     categoria = player_data.get("Categoría")
+    nombre_completo = f"{player_data.get('Nombres','').strip()} {player_data.get('Apellidos','').strip()}".strip()
     if categoria in categorias:
-        row = {"Jugador": nombre_completo}
-        for mes in meses:
-            row[mes] = 0
-        append_row_to_sheet(categoria, row, header_order=["Jugador"] + meses)
+        df_cat = xls.get(categoria, pd.DataFrame(columns=["Jugador"] + meses))
+        # si ya existe nombre en la categoría, no duplicar
+        if nombre_completo not in df_cat["Jugador"].astype(str).values:
+            new_row = {"Jugador": nombre_completo}
+            for m in meses:
+                new_row[m] = 0
+            df_cat = pd.concat([df_cat, pd.DataFrame([new_row])], ignore_index=True)
+            xls[categoria] = df_cat
+    return True, "Jugador agregado en archivo local."
 
-    data["Jugadores"] = refresh_sheet("Jugadores")
-    return True, "✅ Jugador agregado correctamente."
-
-def delete_player_by_document(documento):
-    ws = spreadsheet.worksheet("Jugadores")
-    df = pd.DataFrame(ws.get_all_records())
-    if df.empty:
-        return False, "No hay jugadores registrados."
-    if str(documento) not in df["Documento"].astype(str).values:
-        return False, "Documento no encontrado."
-    row_idx = df.index[df["Documento"].astype(str) == str(documento)][0] + 2
-    ws.delete_rows(row_idx)
-    data["Jugadores"] = refresh_sheet("Jugadores")
-    return True, "✅ Jugador eliminado de 'Jugadores'."
-
-# ===============================
-# 6️⃣ PAGOS
-# ===============================
-def update_monthly_payment(categoria, jugador_nombre, mes, monto):
-    df = load_sheet(categoria)  # ✅ carga bajo demanda
-    if df.empty:
+def update_monthly_in_xls(xls, categoria, jugador_nombre, mes, monto):
+    df_cat = xls.get(categoria)
+    if df_cat is None or df_cat.empty:
         return False, "Hoja de categoría vacía."
-    mask = df["Jugador"].astype(str) == str(jugador_nombre)
+    mask = df_cat["Jugador"].astype(str) == str(jugador_nombre)
     if not mask.any():
-        return False, "Jugador no encontrado."
-    df.loc[mask, mes] = monto
-    save_df_to_sheet(categoria, df)
-    return True, "💰 Pago mensual actualizado."
+        return False, "Jugador no encontrado en categoría."
+    df_cat.loc[mask, mes] = monto
+    xls[categoria] = df_cat
+    return True, "Pago actualizado en archivo local."
 
-def register_uniform(jugador, categoria, fecha, valor, observaciones=""):
-    row = {"Jugador": jugador, "Categoría": categoria, "Fecha": fecha, "Valor": valor, "Observaciones": observaciones}
-    append_row_to_sheet("Uniformes", row)
-    data["Uniformes"] = refresh_sheet("Uniformes")
-    return True, "👕 Registro de uniforme guardado."
+def append_uniform_in_xls(xls, jugador, categoria, fecha, valor, obs):
+    df_uni = xls.get("Uniformes", pd.DataFrame(columns=["Jugador", "Categoría", "Fecha", "Valor", "Observaciones"]))
+    row = {"Jugador": jugador, "Categoría": categoria, "Fecha": fecha, "Valor": valor, "Observaciones": obs}
+    df_uni = pd.concat([df_uni, pd.DataFrame([row])], ignore_index=True)
+    xls["Uniformes"] = df_uni
+    return True, "Uniforme agregado en archivo local."
 
-def register_torneo(jugador, categoria, nombre_torneo, fecha, valor, observaciones=""):
-    row = {"Jugador": jugador, "Categoría": categoria, "Nombre Torneo": nombre_torneo,
-           "Fecha": fecha, "Valor": valor, "Observaciones": observaciones}
-    append_row_to_sheet("Torneos", row)
-    data["Torneos"] = refresh_sheet("Torneos")
-    return True, "🏆 Registro de torneo guardado."
+def append_torneo_in_xls(xls, jugador, categoria, nombre_torneo, fecha, valor, obs):
+    df_t = xls.get("Torneos", pd.DataFrame(columns=["Jugador", "Categoría", "Nombre Torneo", "Fecha", "Valor", "Observaciones"]))
+    row = {"Jugador": jugador, "Categoría": categoria, "Nombre Torneo": nombre_torneo, "Fecha": fecha, "Valor": valor, "Observaciones": obs}
+    df_t = pd.concat([df_t, pd.DataFrame([row])], ignore_index=True)
+    xls["Torneos"] = df_t
+    return True, "Torneo agregado en archivo local."
 
 # ===============================
-# 7️⃣ INTERFAZ STREAMLIT
+# 5️⃣ INTERFAZ STREAMLIT (UI) - usa xls en memoria y sube cuando haya cambios
 # ===============================
-st.title("⚽ Sistema de pagos - Escuela de Fútbol (Google Sheets)")
+st.title("⚽ Sistema de pagos - Escuela de Fútbol (Drive Excel)")
 
-menu = st.sidebar.radio("📂 Navegación", ["👥 Gestión de jugadores", "💸 Registrar pago", "📊 Ver datos"])
+# Cargar inicialmente (cacheada)
+xls, file_id = load_all_from_drive_cached()
+
+menu = st.sidebar.radio("📂 Navegación", ["👥 Gestión de jugadores", "💸 Registrar pago", "📊 Ver datos", "🔁 Sincronizar"])
 
 # ---------- GESTIÓN DE JUGADORES ----------
 if menu == "👥 Gestión de jugadores":
@@ -204,12 +232,17 @@ if menu == "👥 Gestión de jugadores":
                     "Correo": Correo.strip(),
                     "Contacto": Contacto.strip()
                 }
-                ok, msg = add_player_record(player_data)
-                st.success(msg) if ok else st.error(msg)
+                ok, msg = add_player_to_xls(xls, player_data)
+                if ok:
+                    # guardar y subir a Drive (file_id puede ser None y será creado)
+                    file_id = save_excel_and_upload(xls, file_id)
+                    st.success("✅ " + msg + " (subido a Drive).")
+                else:
+                    st.error(msg)
 
     st.markdown("---")
     st.subheader("Buscar / Eliminar jugadores")
-    df_jug = data["Jugadores"]
+    df_jug = xls["Jugadores"]
     if df_jug.empty:
         st.info("No hay jugadores registrados.")
     else:
@@ -219,8 +252,15 @@ if menu == "👥 Gestión de jugadores":
         doc_to_delete = st.text_input("Documento a eliminar")
         if st.button("Eliminar jugador"):
             if doc_to_delete:
-                ok, msg = delete_player_by_document(doc_to_delete.strip())
-                st.success(msg) if ok else st.error(msg)
+                # eliminar localmente
+                df = xls["Jugadores"]
+                if str(doc_to_delete) in df["Documento"].astype(str).values:
+                    df = df[df["Documento"].astype(str) != str(doc_to_delete)]
+                    xls["Jugadores"] = df
+                    file_id = save_excel_and_upload(xls, file_id)
+                    st.success("✅ Jugador eliminado y archivo actualizado.")
+                else:
+                    st.error("Documento no encontrado.")
 
 # ---------- REGISTRAR PAGO ----------
 elif menu == "💸 Registrar pago":
@@ -229,7 +269,7 @@ elif menu == "💸 Registrar pago":
 
     if tipo == "Mensualidad":
         categoria = st.selectbox("Categoría", categorias)
-        df_cat = load_sheet(categoria)
+        df_cat = xls.get(categoria, pd.DataFrame(columns=["Jugador"] + meses))
         if df_cat.empty:
             st.warning("No hay jugadores en esta categoría.")
         else:
@@ -237,12 +277,16 @@ elif menu == "💸 Registrar pago":
             mes = st.selectbox("Mes", meses)
             monto = st.number_input("Monto", min_value=0.0, step=1000.0)
             if st.button("Guardar mensualidad"):
-                ok, msg = update_monthly_payment(categoria, jugador, mes, monto)
-                st.success(msg) if ok else st.error(msg)
+                ok, msg = update_monthly_in_xls(xls, categoria, jugador, mes, monto)
+                if ok:
+                    file_id = save_excel_and_upload(xls, file_id)
+                    st.success("✅ " + msg + " (subido a Drive).")
+                else:
+                    st.error(msg)
 
     elif tipo == "Uniforme":
-        df_jug = data["Jugadores"]
-        jugadores_list = (df_jug["Nombres"] + " " + df_jug["Apellidos"]).tolist() if not df_jug.empty else []
+        df_jug = xls["Jugadores"]
+        jugadores_list = (df_jug["Nombres"].astype(str) + " " + df_jug["Apellidos"].astype(str)).tolist() if not df_jug.empty else []
         jugador = st.selectbox("Jugador", jugadores_list)
         categoria = st.selectbox("Categoría", categorias)
         fecha = st.date_input("Fecha")
@@ -250,12 +294,16 @@ elif menu == "💸 Registrar pago":
         obs = st.text_input("Observaciones")
         if st.button("Registrar uniforme"):
             fecha_str = fecha.isoformat() if fecha else ""
-            ok, msg = register_uniform(jugador, categoria, fecha_str, valor, obs)
-            st.success(msg) if ok else st.error(msg)
+            ok, msg = append_uniform_in_xls(xls, jugador, categoria, fecha_str, valor, obs)
+            if ok:
+                file_id = save_excel_and_upload(xls, file_id)
+                st.success("✅ " + msg + " (subido a Drive).")
+            else:
+                st.error(msg)
 
     elif tipo == "Torneo":
-        df_jug = data["Jugadores"]
-        jugadores_list = (df_jug["Nombres"] + " " + df_jug["Apellidos"]).tolist() if not df_jug.empty else []
+        df_jug = xls["Jugadores"]
+        jugadores_list = (df_jug["Nombres"].astype(str) + " " + df_jug["Apellidos"].astype(str)).tolist() if not df_jug.empty else []
         jugador = st.selectbox("Jugador", jugadores_list)
         categoria = st.selectbox("Categoría", categorias)
         nombre_torneo = st.text_input("Nombre Torneo")
@@ -264,18 +312,34 @@ elif menu == "💸 Registrar pago":
         obs = st.text_input("Observaciones")
         if st.button("Registrar torneo"):
             fecha_str = fecha.isoformat() if fecha else ""
-            ok, msg = register_torneo(jugador, categoria, nombre_torneo, fecha_str, valor, obs)
-            st.success(msg) if ok else st.error(msg)
+            ok, msg = append_torneo_in_xls(xls, jugador, categoria, nombre_torneo, fecha_str, valor, obs)
+            if ok:
+                file_id = save_excel_and_upload(xls, file_id)
+                st.success("✅ " + msg + " (subido a Drive).")
+            else:
+                st.error(msg)
+
+# ---------- SINCRONIZAR / VER DATOS ----------
+elif menu == "🔁 Sincronizar":
+    st.header("🔁 Sincronizar / Forzar descarga desde Drive")
+    if st.button("Descargar última versión desde Drive"):
+        xls, file_id = load_excel_from_drive()
+        st.success("✅ Archivo descargado y cargado en memoria.")
+    st.markdown("---")
+    st.subheader("Ver hojas")
+    hoja = st.selectbox("Selecciona hoja", ["Jugadores"] + categorias + ["Uniformes", "Torneos"])
+    st.dataframe(xls.get(hoja, pd.DataFrame({"Info": ["Hoja vacía"]})))
 
 # ---------- VER DATOS ----------
 elif menu == "📊 Ver datos":
     st.header("📊 Ver datos (hojas)")
-    hoja = st.selectbox("Selecciona hoja para ver", ["Jugadores"] + ["Uniformes", "Torneos"])
-    df = data[hoja]
-    st.dataframe(df if not df.empty else pd.DataFrame({"Info": ["No hay datos en esta hoja"]}))
+    hoja = st.selectbox("Selecciona hoja para ver", ["Jugadores"] + categorias + ["Uniformes", "Torneos"])
+    st.dataframe(xls.get(hoja, pd.DataFrame({"Info": ["No hay datos en esta hoja"]})))
+
 
 
    
+
 
 
 
